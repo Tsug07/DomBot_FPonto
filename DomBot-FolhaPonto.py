@@ -131,7 +131,7 @@ class AutomacaoGUI:
     def set_window_icon(self):
         """Configura o ícone da janela"""
         try:
-            icon_path = os.path.join(os.path.dirname(__file__), "assets", "bot-folha-de-pagamento.ico")
+            icon_path = os.path.join(os.path.dirname(__file__), "assets", "favicon.ico")
             if os.name == 'nt' and os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
