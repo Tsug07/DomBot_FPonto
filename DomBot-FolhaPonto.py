@@ -12,8 +12,19 @@ import os
 from PIL import Image, ImageDraw
 import traceback
 import threading
-from pywinauto.timings import wait_until
+import unicodedata
+import re
 from typing import Optional
+
+
+def sanitizar_nome_arquivo(nome: str) -> str:
+    """Remove caracteres inválidos para nomes de arquivo no Windows."""
+    nome = unicodedata.normalize('NFKD', nome).encode('ascii', 'ignore').decode('ascii')
+    nome = re.sub(r'[\\/:*?"<>|]', '', nome)
+    nome = nome.strip()
+    if len(nome) > 200:
+        nome = nome[:200]
+    return nome
 
 
 # Handler de log separado da classe principal
@@ -739,6 +750,248 @@ class DominioAutomation:
     def log(self, message):
         self.logger.info(message)
 
+    def should_stop(self) -> bool:
+        """Verifica se deve parar a execução"""
+        return not self.gui.executando
+
+    def check_pause(self):
+        """Verifica e aguarda se pausado"""
+        while self.gui.pausado and self.gui.executando:
+            time.sleep(0.5)
+
+    def smart_sleep(self, seconds: float) -> bool:
+        """Sleep interruptível que verifica pausa/parada"""
+        interval = 0.15
+        elapsed = 0.0
+        while elapsed < seconds:
+            if self.should_stop():
+                return False
+            self.check_pause()
+            if self.should_stop():
+                return False
+            sleep_time = min(interval, seconds - elapsed)
+            time.sleep(sleep_time)
+            elapsed += sleep_time
+        return True
+
+    def wait_for_condition(self, condition_fn, timeout: float = 30, poll_interval: float = 0.15, description: str = "") -> bool:
+        """Polls condition_fn() até retornar True, ou timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.should_stop():
+                return False
+            self.check_pause()
+            try:
+                if condition_fn():
+                    if description:
+                        self.log(f"{description} - concluido em {time.time() - start:.1f}s")
+                    return True
+            except Exception:
+                pass
+            time.sleep(poll_interval)
+        if description:
+            self.log(f"{description} - timeout apos {timeout}s")
+        return False
+
+    def _window_exists(self, title: str, class_name: str) -> bool:
+        """Verifica se janela com título/classe existe via win32gui (rápido)."""
+        try:
+            result = [False]
+            def callback(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    try:
+                        if (win32gui.GetWindowText(hwnd) == title and
+                                win32gui.GetClassName(hwnd) == class_name):
+                            result[0] = True
+                            return False
+                    except Exception:
+                        pass
+                return True
+            win32gui.EnumWindows(callback, None)
+            return result[0]
+        except Exception:
+            return False
+
+    def _any_error_dialog_visible(self) -> bool:
+        """Verifica se há diálogo de erro visível via win32gui."""
+        error_keywords = ("erro", "aviso", "atenção", "alerta", "warning", "error", "informação")
+        try:
+            result = [False]
+            def callback(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    try:
+                        cls = win32gui.GetClassName(hwnd)
+                        if cls == "#32770":
+                            title = win32gui.GetWindowText(hwnd).lower()
+                            for kw in error_keywords:
+                                if kw in title:
+                                    result[0] = True
+                                    return False
+                    except Exception:
+                        pass
+                return True
+            win32gui.EnumWindows(callback, None)
+            return result[0]
+        except Exception:
+            return False
+
+    def _is_connection_alive(self) -> bool:
+        """Verifica se a conexão pywinauto ainda é válida."""
+        if self.app is None or self.main_window is None:
+            return False
+        try:
+            hwnd = self.main_window.handle
+            if not win32gui.IsWindow(hwnd):
+                return False
+            win32gui.GetWindowText(hwnd)
+            return True
+        except Exception:
+            return False
+
+    def handle_error_dialogs(self) -> bool:
+        """Trata diálogos de erro que podem aparecer.
+        Retorna True se deve continuar, False se deve abortar."""
+        try:
+            error_titles_lower = {"erro", "erro léxico", "aviso", "atenção",
+                                  "informação", "alerta", "warning", "error"}
+
+            found_hwnd = None
+            found_title = None
+
+            def enum_callback(hwnd, _):
+                nonlocal found_hwnd, found_title
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                try:
+                    title = win32gui.GetWindowText(hwnd)
+                    if not title:
+                        return True
+                    title_lower = title.strip().lower()
+                    for err_title in error_titles_lower:
+                        if title_lower == err_title or err_title in title_lower:
+                            if win32gui.GetClassName(hwnd) == "#32770":
+                                found_hwnd = hwnd
+                                found_title = title
+                                return False
+                except Exception:
+                    pass
+                return True
+
+            win32gui.EnumWindows(enum_callback, None)
+
+            if found_hwnd is None:
+                return True
+
+            try:
+                error_window = self.app.window(handle=found_hwnd)
+            except Exception:
+                win32gui.SetForegroundWindow(found_hwnd)
+                send_keys('{ENTER}')
+                time.sleep(0.3)
+                return True
+
+            message = ""
+            try:
+                message = error_window.window_text()
+                try:
+                    static_texts = error_window.children(class_name="Static")
+                    for static in static_texts:
+                        text = static.window_text()
+                        if text:
+                            message += " " + text
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            self.log(f"Diálogo detectado: '{found_title}' - {message[:100] if message else 'sem mensagem'}")
+
+            mensagens_continuar = [
+                "sem dados para emitir",
+                "nenhum registro encontrado",
+                "não há dados",
+                "registro não encontrado"
+            ]
+
+            message_lower = message.lower()
+            for msg in mensagens_continuar:
+                if msg in message_lower:
+                    self.log(f"Aviso não crítico: {msg}")
+                    error_window.set_focus()
+                    send_keys('{ENTER}')
+                    time.sleep(0.5)
+                    for _ in range(4):
+                        send_keys('{ESC}')
+                        time.sleep(0.5)
+                    return False
+
+            if "léxico" in found_title.lower():
+                self.log("Erro léxico detectado, fechando...")
+                error_window.set_focus()
+                for _ in range(3):
+                    send_keys('{ESC}')
+                    time.sleep(0.5)
+                return True
+
+            self.log(f"Fechando diálogo '{found_title}'...")
+            error_window.set_focus()
+            time.sleep(0.2)
+
+            try:
+                ok_button = error_window.child_window(title="OK", class_name="Button")
+                if ok_button.exists():
+                    ok_button.click_input()
+                    time.sleep(0.5)
+                    if found_title.lower() in ("erro", "aviso"):
+                        return False
+                    return True
+            except Exception:
+                pass
+
+            send_keys('{ENTER}')
+            time.sleep(0.5)
+
+            try:
+                if error_window.exists():
+                    send_keys('{ESC}')
+                    time.sleep(0.3)
+            except Exception:
+                pass
+
+            if found_title.lower() in ("erro", "aviso"):
+                return False
+
+            return True
+
+        except Exception as e:
+            self.log(f"Exceção ao verificar diálogos: {str(e)}")
+            return True
+
+    def cleanup_windows(self):
+        """Limpa e fecha janelas abertas"""
+        try:
+            self.log("Limpando janelas")
+            self.main_window.set_focus()
+
+            for _ in range(4):
+                send_keys('{ESC}')
+                time.sleep(0.5)
+
+            try:
+                relatorio_window = self.main_window.child_window(
+                    title="Gerenciador de Relatórios",
+                    class_name="FNWND3190"
+                )
+                if relatorio_window.exists() and relatorio_window.is_visible():
+                    self.log("Fechando Gerenciador de Relatórios restante")
+                    send_keys('{ESC}')
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        except Exception as e:
+            self.log(f"Erro durante limpeza: {str(e)}")
+
     def find_dominio_window(self) -> Optional[int]:
         """Encontra a janela do Domínio Folha"""
         try:
@@ -830,20 +1083,24 @@ class DominioAutomation:
 
             if win32gui.IsIconic(handle):
                 win32gui.ShowWindow(handle, win32con.SW_RESTORE)
-                time.sleep(1)
+                if not self.smart_sleep(1):
+                    return False
 
             win32gui.SetForegroundWindow(handle)
-            time.sleep(0.5)
+            if not self.smart_sleep(0.5):
+                return False
 
             app = Application(backend="uia").connect(handle=handle)
             main_window = app.window(handle=handle)
 
             main_window.set_focus()
-            time.sleep(0.5)
+            if not self.smart_sleep(0.5):
+                return False
 
             self.log("Enviando F8 para troca de empresas")
             send_keys('{F8}')
-            time.sleep(1.5)
+            if not self.smart_sleep(1.5):
+                return False
 
             try:
                 troca_empresas_window = None
@@ -867,7 +1124,8 @@ class DominioAutomation:
                         if attempt == max_attempts - 1:
                             self.log("Janela 'Troca de empresas' não encontrada após várias tentativas.")
                             return False
-                        time.sleep(1)
+                        if not self.smart_sleep(1):
+                            return False
 
                 if not troca_empresas_window:
                     self.log("Janela 'Troca de empresas' não encontrada.")
@@ -881,10 +1139,12 @@ class DominioAutomation:
             empresa_num = str(int(row['Nº']))
             self.log(f"Enviando código da empresa: {empresa_num}")
             send_keys(empresa_num)
-            time.sleep(0.3)
+            if not self.smart_sleep(0.3):
+                return False
 
             send_keys('{ENTER}')
-            time.sleep(6)
+            if not self.smart_sleep(6):
+                return False
 
             self.wait_and_check_window_closed(troca_empresas_window, "Troca de empresas")
 
@@ -898,7 +1158,7 @@ class DominioAutomation:
                     self.log("Janela 'Avisos de Vencimento' encontrada - executando fechamento")
                     aviso_window.set_focus()
                     send_keys('{ESC}')
-                    time.sleep(1)
+                    self.smart_sleep(1)
                     send_keys('{ESC}')
                     self.log("ESCs executados para fechar 'Avisos de Vencimento'")
             except Exception:
@@ -907,13 +1167,17 @@ class DominioAutomation:
             self.log("Enviando comandos para acessar relatórios")
             main_window.set_focus()
             send_keys('%r')
-            time.sleep(0.5)
+            if not self.smart_sleep(0.5):
+                return False
             send_keys('i')
-            time.sleep(0.5)
+            if not self.smart_sleep(0.5):
+                return False
             send_keys('i')
-            time.sleep(0.5)
+            if not self.smart_sleep(0.5):
+                return False
             send_keys('{ENTER}')
-            time.sleep(1)
+            if not self.smart_sleep(1):
+                return False
 
             try:
                 max_attempts = 3
@@ -932,7 +1196,8 @@ class DominioAutomation:
                         if attempt == max_attempts - 1:
                             self.log("Janela 'Gerenciador de Relatórios' não encontrada após várias tentativas.")
                             return False
-                        time.sleep(1)
+                        if not self.smart_sleep(1):
+                            return False
 
                 if not relatorio_window or not relatorio_window.exists():
                     self.log("Janela 'Gerenciador de Relatórios' não encontrada.")
@@ -968,126 +1233,186 @@ class DominioAutomation:
                 self.log("Clicando em executar relatório")
                 button_executar = relatorio_window.child_window(auto_id="1007", class_name="Button")
                 button_executar.click_input()
-                time.sleep(2)
+                if not self.smart_sleep(2):
+                    return False
 
+                # Verificar se apareceu erro durante a execução do relatório
+                if self._any_error_dialog_visible():
+                    if not self.handle_error_dialogs():
+                        self.cleanup_windows()
+                        return False
+
+                # === PUBLICAÇÃO DO DOCUMENTO ===
                 self.log("Clicando no ícone de publicação")
                 main_window.set_focus()
-                button_publicacao = main_window.child_window(auto_id="1005", class_name="FNUDO3190")
+                button_publicacao = main_window.child_window(auto_id="1006", class_name="FNUDO3190")
                 button_publicacao.click_input()
-                time.sleep(1)
+                if not self.smart_sleep(1):
+                    return False
 
                 try:
+                    # Aguardar janela de Publicação de Documentos com polling
+                    if not self.wait_for_condition(
+                        lambda: main_window.child_window(
+                            title="Publicação de Documentos",
+                            class_name="FNWNS3190"
+                        ).exists(),
+                        timeout=10,
+                        poll_interval=0.2,
+                        description="Aguardando janela Publicação de Documentos"
+                    ):
+                        self.log("Janela 'Publicação de Documentos' não encontrada.")
+                        return False
+
                     pub_doc_window = main_window.child_window(
                         title="Publicação de Documentos",
                         class_name="FNWNS3190"
                     )
 
-                    if not pub_doc_window.exists():
-                        self.log("Janela 'Publicação de Documentos' não encontrada.")
-                        return False
-
                     self.log("Janela de publicação localizada")
 
+                    # Selecionar categoria no ComboBox
+                    self.log("Selecionando categoria: Pessoal/Folha de Ponto")
                     combo_box = pub_doc_window.child_window(auto_id="1007", class_name="ComboBox")
                     combo_box.click_input()
                     time.sleep(0.5)
                     send_keys("Pessoal/Folha de Ponto{ENTER}")
                     time.sleep(0.5)
 
-                    nome_pdf = str(row['nome pdf'])
+                    if self.should_stop():
+                        return False
+
+                    # Definir nome do documento
+                    nome_pdf = sanitizar_nome_arquivo(str(row['nome pdf']))
                     self.log(f"Definindo nome do PDF: {nome_pdf}")
                     edit_field = pub_doc_window.child_window(auto_id="1014", class_name="Edit")
                     edit_field.set_text(nome_pdf)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
 
+                    # Clicar em Gravar
                     self.log("Clicando em gravar")
                     button_gravar = pub_doc_window.child_window(auto_id="1016", class_name="Button")
                     button_gravar.click_input()
-                    time.sleep(0.5)
 
-                    self.wait_and_check_window_closed(pub_doc_window, "Publicação de Documentos")
+                    # Aguardar fechamento da janela de publicação
+                    if not self.wait_for_condition(
+                        lambda: not pub_doc_window.exists() or not pub_doc_window.is_visible(),
+                        timeout=10,
+                        poll_interval=0.2,
+                        description="Aguardando fechamento da Publicação de Documentos"
+                    ):
+                        self.log("Timeout aguardando fechamento da publicação")
+                        return False
+
+                    self.log("Documento publicado com sucesso")
+
+                    # === GERAÇÃO DO PDF ===
+                    # Verificar e tratar janela de erro
+                    if not self.handle_error_dialogs():
+                        self.cleanup_windows()
+                        return False
+
+                    # Aguardar processamento da publicação
+                    if not self.smart_sleep(3):
+                        return False
 
                     self.log("Gerando PDF")
-                    button_pdf = main_window.child_window(auto_id="1014", class_name="FNUDO3190")
+                    main_window.set_focus()
+                    button_pdf = main_window.child_window(auto_id="1015", class_name="FNUDO3190")
                     button_pdf.click_input()
-                    time.sleep(1)
 
+                    # Esperar janela "Salvar em PDF" ou diálogo de erro
+                    if not self.wait_for_condition(
+                        lambda: self._window_exists("Salvar em PDF", "#32770") or self._any_error_dialog_visible(),
+                        timeout=10,
+                        poll_interval=0.15,
+                        description="Aguardando janela Salvar em PDF"
+                    ):
+                        self.log("Timeout aguardando janela de salvamento PDF")
+                        return False
+
+                    # Se apareceu diálogo de erro, apenas fechar e continuar
+                    # (o Domínio pode mostrar erro de gravação mas a janela Salvar em PDF aparece depois)
+                    if self._any_error_dialog_visible():
+                        self.log("Diálogo de erro detectado após gerar PDF, fechando e continuando...")
+                        try:
+                            error_win = main_window.child_window(title="Erro", class_name="#32770")
+                            if error_win.exists() and error_win.is_visible():
+                                ok_btn = error_win.child_window(title="OK", class_name="Button")
+                                if ok_btn.exists():
+                                    ok_btn.click_input()
+                                    time.sleep(0.5)
+                                    self.log("Botão OK clicado no diálogo de erro")
+                        except Exception as e:
+                            self.log(f"Erro ao fechar diálogo: {e}")
+                            send_keys('{ENTER}')
+                            time.sleep(0.5)
+
+                        # Aguardar a janela "Salvar em PDF" aparecer após fechar o erro
+                        if not self.wait_for_condition(
+                            lambda: self._window_exists("Salvar em PDF", "#32770"),
+                            timeout=10,
+                            poll_interval=0.15,
+                            description="Aguardando janela Salvar em PDF após fechar erro"
+                        ):
+                            self.log("Janela Salvar em PDF não apareceu após fechar erro")
+                            self.cleanup_windows()
+                            return False
+
+                    # Localizar janela de salvamento
+                    self.log("Configurando salvamento do PDF")
                     try:
-                        error_window = main_window.child_window(
-                            title="Erro",
-                            class_name="#32770"
-                        )
-
-                        if error_window.exists() and error_window.is_visible():
-                            self.log("Janela de erro detectada. Clicando em OK.")
-                            ok_button = error_window.child_window(title="OK", class_name="Button")
-                            if ok_button.exists():
-                                ok_button.click_input()
-                                time.sleep(0.5)
-                                self.log("Botão OK clicado. Continuando o fluxo.")
-                    except Exception as e:
-                        self.log(f"Nenhuma janela de erro encontrada ou erro ao tratar: {e}")
-
-                    try:
-                        wait_until(timeout=10, retry_interval=0.5, func=lambda: main_window.child_window(
-                            title="Salvar em PDF",
-                            class_name="#32770"
-                        ).exists())
-
                         save_window = main_window.child_window(
                             title="Salvar em PDF",
                             class_name="#32770"
                         )
 
-                        if save_window.exists():
-                            self.log("Janela de salvamento PDF localizada")
+                        if not save_window.exists():
+                            self.log("Janela de salvamento não encontrada")
+                            return False
 
-                            time.sleep(0.5)
-                            name_field = save_window.child_window(auto_id="1148", class_name="Edit")
-                            name_field.set_text(nome_pdf)
-                            time.sleep(0.5)
+                        if self.should_stop():
+                            return False
+                        self.check_pause()
 
-                            self.log("Salvando PDF")
-                            button_salvar = save_window.child_window(auto_id="1", class_name="Button")
-                            button_salvar.click_input()
-                            time.sleep(3)
+                        time.sleep(0.5)
+                        name_field = save_window.child_window(auto_id="1148", class_name="Edit")
+                        name_field.set_text(nome_pdf)
+                        time.sleep(0.3)
+
+                        if self.should_stop():
+                            return False
+
+                        self.log("Salvando PDF")
+                        button_salvar = save_window.child_window(auto_id="1", class_name="Button")
+                        button_salvar.click_input()
+
+                        # Esperar janela de salvamento fechar
+                        if not self.wait_for_condition(
+                            lambda: not save_window.exists() or not save_window.is_visible(),
+                            timeout=15,
+                            poll_interval=0.2,
+                            description="Aguardando salvamento do PDF"
+                        ):
+                            self.log("Timeout aguardando salvamento do PDF")
+                            return False
+
                     except Exception as e:
-                        self.log(f"Erro ao interagir com janela de salvamento: {str(e)}")
+                        self.log(f"Erro durante salvamento: {str(e)}")
                         return False
 
+                    # Fechar visualização do relatório
                     self.log("Fechando janelas")
-                    send_keys('^w')
-                    time.sleep(1)
+                    send_keys('{ESC}')
+                    if not self.smart_sleep(1):
+                        return False
 
                 except Exception as e:
                     self.log(f"Erro na publicação: {str(e)}")
                     return False
 
-                main_window.set_focus()
-                send_keys('{ESC}')
-                time.sleep(1)
-
-                main_window.set_focus()
-                send_keys('{ESC}')
-                time.sleep(1)
-
-                main_window.set_focus()
-                send_keys('{ESC}')
-                time.sleep(1)
-
-                try:
-                    relatorio_window = main_window.child_window(
-                        title="Gerenciador de Relatórios",
-                        class_name="FNWND3190"
-                    )
-
-                    if relatorio_window.exists() and relatorio_window.is_visible():
-                        self.log("Janela de relatórios ainda aberta, enviando ESC adicional")
-                        main_window.set_focus()
-                        send_keys('{ESC}')
-                        time.sleep(1)
-                except Exception:
-                    pass
+                # Limpeza final - fechar janelas restantes
+                self.cleanup_windows()
 
             except Exception as e:
                 self.log(f"Erro ao interagir com o Gerenciador de Relatórios: {str(e)}")
