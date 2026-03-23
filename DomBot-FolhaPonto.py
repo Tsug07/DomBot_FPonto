@@ -689,10 +689,15 @@ class AutomacaoGUI:
                     log_msg = (f"Linha {index + 1} - Nº {row['Nº']} - "
                                f"EMPRESA: {row.get('EMPRESA', 'N/A')}")
 
-                    success = automacao.processar_linha(row, index)
+                    result = automacao.processar_linha(row, index)
 
                     # Log do resultado
-                    if success:
+                    if result == "bloqueado":
+                        self.error_logger.warning(f"{log_msg} - Empresa bloqueada por Honorários")
+                        self.adicionar_log(f"Linha {index + 1} - Empresa bloqueada por Honorários, pulando...", logging.WARNING, "aviso")
+                        self.atualizar_estatisticas(erro=True)
+                        continue  # Pula para a próxima linha em vez de parar
+                    elif result:
                         self.success_logger.info(f"{log_msg} - Enviado com sucesso")
                         self.adicionar_log(f"Linha {index + 1} processada com sucesso", logging.INFO, "sucesso")
                         self.atualizar_estatisticas(sucesso=True)
@@ -1148,6 +1153,39 @@ class DominioAutomation:
 
             self.wait_and_check_window_closed(troca_empresas_window, "Troca de empresas")
 
+            # Verificar se a empresa está bloqueada por Honorários
+            try:
+                bloqueio_encontrado = False
+                dialogs = main_window.children(class_name="#32770")
+                for dlg in dialogs:
+                    try:
+                        if not dlg.is_visible():
+                            continue
+                        statics = dlg.children(class_name="Static")
+                        for st in statics:
+                            try:
+                                texto = st.window_text()
+                                if "bloqueado" in texto.lower() and "honorários" in texto.lower():
+                                    bloqueio_encontrado = True
+                                    break
+                            except Exception:
+                                continue
+                        if bloqueio_encontrado:
+                            break
+                    except Exception:
+                        continue
+
+                if bloqueio_encontrado:
+                    self.log(f"⚠️ Empresa {empresa_num} bloqueada pelo módulo Honorários - pulando linha")
+                    # Fechar o diálogo
+                    send_keys('{ENTER}')
+                    self.smart_sleep(1)
+                    send_keys('{ESC}')
+                    self.smart_sleep(0.5)
+                    return "bloqueado"
+            except Exception as e:
+                self.log(f"Erro ao verificar bloqueio por honorários: {e}")
+
             try:
                 aviso_window = main_window.child_window(
                     title="Avisos de Vencimento",
@@ -1233,7 +1271,7 @@ class DominioAutomation:
                 self.log("Clicando em executar relatório")
                 button_executar = relatorio_window.child_window(auto_id="1007", class_name="Button")
                 button_executar.click_input()
-                if not self.smart_sleep(2):
+                if not self.smart_sleep(8):
                     return False
 
                 # Verificar se apareceu erro durante a execução do relatório
@@ -1243,27 +1281,119 @@ class DominioAutomation:
                         return False
 
                 # === PUBLICAÇÃO DO DOCUMENTO ===
-                self.log("Clicando no ícone de publicação")
-                main_window.set_focus()
-                button_publicacao = main_window.child_window(auto_id="1006", class_name="FNUDO3190")
-                button_publicacao.click_input()
-                if not self.smart_sleep(1):
+                # Aguardar carregamento completo dos botões antes de clicar
+                # Os botões do visualizador levam alguns segundos para estabilizar
+                self.log("Aguardando carregamento dos botões do visualizador...")
+                if not self.smart_sleep(5):
                     return False
 
-                try:
-                    # Aguardar janela de Publicação de Documentos com polling
-                    if not self.wait_for_condition(
+                max_tentativas_pub = 5
+                pub_ok = False
+
+                for tentativa_pub in range(max_tentativas_pub):
+                    self.log(f"Clicando no ícone de publicação (tentativa {tentativa_pub + 1})")
+                    main_window.set_focus()
+                    try:
+                        # Buscar o botão de publicação (auto_id="1006", FNUDO3190)
+                        # na barra lateral esquerda do visualizador
+                        botoes = main_window.descendants(class_name="FNUDO3190")
+                        button_publicacao = None
+                        for btn in botoes:
+                            try:
+                                elem_info = btn.element_info
+                                if elem_info.automation_id != "1006":
+                                    continue
+                                rect = btn.rectangle()
+                                largura = rect.right - rect.left
+                                altura = rect.bottom - rect.top
+                                # Botão da barra lateral: fica na esquerda (x < 100) e tamanho ~65x40
+                                if rect.left < 100 and 30 <= largura <= 80 and 20 <= altura <= 60:
+                                    button_publicacao = btn
+                                    self.log(f"Botão publicação encontrado: ({rect.left},{rect.top})-({rect.right},{rect.bottom})")
+                                    break
+                            except Exception:
+                                continue
+
+                        if not button_publicacao:
+                            # Fallback: pegar qualquer 1006/FNUDO3190
+                            for btn in botoes:
+                                try:
+                                    if btn.element_info.automation_id == "1006":
+                                        button_publicacao = btn
+                                        self.log("Usando fallback: primeiro botão 1006 encontrado")
+                                        break
+                                except Exception:
+                                    continue
+
+                        if button_publicacao:
+                            button_publicacao.click_input()
+                        else:
+                            self.log("Nenhum botão com auto_id=1006/FNUDO3190 encontrado")
+                            if not self.smart_sleep(2):
+                                return False
+                            continue
+                    except Exception as e:
+                        self.log(f"Erro ao localizar botão de publicação: {e}")
+                        if not self.smart_sleep(2):
+                            return False
+                        continue
+                    if not self.smart_sleep(2):
+                        return False
+
+                    # Verificar se abriu "Portal do Cliente" em vez de "Publicação de Documentos"
+                    portal_aberto = False
+                    try:
+                        portal_window = main_window.child_window(
+                            title="Portal do Cliente",
+                            class_name="Chrome_RenderWidgetHostHWND"
+                        )
+                        if portal_window.exists() and portal_window.is_visible():
+                            portal_aberto = True
+                            self.log("Janela 'Portal do Cliente' aberta por engano - fechando")
+                            # Fechar o portal
+                            send_keys('{ESC}')
+                            if not self.smart_sleep(1):
+                                return False
+                            send_keys('^w')
+                            if not self.smart_sleep(1):
+                                return False
+                            # Enviar ESC adicional para garantir fechamento
+                            send_keys('{ESC}')
+                            if not self.smart_sleep(1):
+                                return False
+                    except Exception:
+                        pass
+
+                    if portal_aberto:
+                        # Esperar mais tempo para os botões estabilizarem antes da próxima tentativa
+                        self.log("Aguardando estabilização dos botões...")
+                        if not self.smart_sleep(3):
+                            return False
+                        continue
+
+                    # Verificar se a janela de publicação abriu corretamente
+                    if self.wait_for_condition(
                         lambda: main_window.child_window(
                             title="Publicação de Documentos",
                             class_name="FNWNS3190"
                         ).exists(),
-                        timeout=10,
+                        timeout=5,
                         poll_interval=0.2,
                         description="Aguardando janela Publicação de Documentos"
                     ):
-                        self.log("Janela 'Publicação de Documentos' não encontrada.")
-                        return False
+                        pub_ok = True
+                        break
+                    else:
+                        self.log("Janela de publicação não apareceu, tentando novamente...")
+                        send_keys('{ESC}')
+                        if not self.smart_sleep(2):
+                            return False
 
+                if not pub_ok:
+                    self.log("Não foi possível abrir a janela de Publicação de Documentos após várias tentativas")
+                    return False
+
+                try:
                     pub_doc_window = main_window.child_window(
                         title="Publicação de Documentos",
                         class_name="FNWNS3190"
