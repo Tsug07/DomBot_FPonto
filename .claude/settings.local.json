@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import py_compile; py_compile.compile\\(''DomBot-FolhaPonto.py'', doraise=True\\); print\\(''OK - sem erros de sintaxe''\\)\")",
-      "Bash(python -c \"import py_compile; py_compile.compile\\(''DomBot-FolhaPonto.py'', doraise=True\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''DomBot-FolhaPonto.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('DomBot-FolhaPonto.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

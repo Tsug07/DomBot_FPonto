@@ -1446,10 +1446,9 @@ class DominioAutomation:
                     if not self.smart_sleep(3):
                         return False
 
-                    self.log("Gerando PDF")
+                    self.log("Gerando PDF (Ctrl+D)")
                     main_window.set_focus()
-                    button_pdf = main_window.child_window(auto_id="1015", class_name="FNUDO3190")
-                    button_pdf.click_input()
+                    send_keys('^d')
 
                     # Esperar janela "Salvar em PDF" ou diálogo de erro
                     if not self.wait_for_condition(
