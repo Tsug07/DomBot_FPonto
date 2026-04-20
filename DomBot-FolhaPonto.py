@@ -15,6 +15,10 @@ import threading
 import unicodedata
 import re
 from typing import Optional
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def sanitizar_nome_arquivo(nome: str) -> str:
@@ -35,7 +39,7 @@ class GUILogHandler(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record)
-        self.gui.adicionar_log(msg, record.levelno)
+        self.gui.window.after(0, lambda: self.gui.adicionar_log(msg, record.levelno))
 
 
 class AutomacaoGUI:
@@ -90,9 +94,16 @@ class AutomacaoGUI:
         # Configurar logging para arquivos
         self.setup_file_logging()
 
+        # Competência padrão: 1 mês acima do atual
+        _hoje = datetime.now()
+        _mes_comp = _hoje.month + 1 if _hoje.month < 12 else 1
+        _ano_comp = _hoje.year if _hoje.month < 12 else _hoje.year + 1
+
         # Variáveis
         self.arquivo_excel = ctk.StringVar()
         self.linha_inicial = ctk.StringVar(value="2")
+        self.competencia = ctk.StringVar(value=f"{_mes_comp:02d}/{_ano_comp}")
+        self.diretorio_salvamento = ctk.StringVar()
         self.status_var = ctk.StringVar(value="Aguardando início...")
         self.empresa_atual_var = ctk.StringVar(value="-")
 
@@ -290,6 +301,68 @@ class AutomacaoGUI:
             fg_color=self.CORES['erro'], hover_color="#C0392B", state="disabled"
         )
         self.btn_parar.grid(row=0, column=7, padx=(3, 0))
+
+        # Segunda linha — Competência e Diretório de salvamento
+        inner_frame2 = ctk.CTkFrame(config_frame, fg_color="transparent")
+        inner_frame2.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        inner_frame2.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            inner_frame2, text="📅", font=ctk.CTkFont(size=14)
+        ).grid(row=0, column=0, padx=(0, 5))
+
+        ctk.CTkLabel(
+            inner_frame2, text="Competência:", font=ctk.CTkFont(size=11), text_color="#BDC3C7"
+        ).grid(row=0, column=1, padx=(0, 3))
+
+        self.entry_competencia = ctk.CTkEntry(
+            inner_frame2, textvariable=self.competencia,
+            width=80, height=32, font=ctk.CTkFont(size=11), justify="center",
+            placeholder_text="mm/aaaa"
+        )
+        self.entry_competencia.grid(row=0, column=2, sticky="w", padx=(0, 15))
+
+        ctk.CTkLabel(
+            inner_frame2, text="📂", font=ctk.CTkFont(size=14)
+        ).grid(row=0, column=3, padx=(0, 5))
+
+        self.entry_diretorio = ctk.CTkEntry(
+            inner_frame2,
+            textvariable=self.diretorio_salvamento,
+            placeholder_text="Diretório onde os PDFs serão salvos (opcional)...",
+            height=32,
+            font=ctk.CTkFont(size=11)
+        )
+        self.entry_diretorio.grid(row=0, column=4, sticky="ew", padx=(0, 8))
+        inner_frame2.grid_columnconfigure(4, weight=1)
+
+        ctk.CTkButton(
+            inner_frame2, text="Selecionar", command=self.selecionar_diretorio,
+            width=80, height=32, font=ctk.CTkFont(size=11),
+            fg_color=self.CORES['info'], hover_color="#2980B9"
+        ).grid(row=0, column=5)
+
+    def selecionar_diretorio(self):
+        """Abre diálogo para selecionar diretório de salvamento dos PDFs"""
+        import subprocess
+        try:
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$f.Description = 'Selecione o diretório para salvar os PDFs'; "
+                "$f.ShowNewFolderButton = $true; "
+                "if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { '' }"
+            )
+            result = subprocess.run(
+                ["powershell", "-Command", script],
+                capture_output=True, text=True, timeout=120
+            )
+            diretorio = result.stdout.strip()
+            if diretorio:
+                self.diretorio_salvamento.set(diretorio)
+                self.adicionar_log(f"Diretório de salvamento: {diretorio}", logging.INFO, "info")
+        except Exception as e:
+            self.adicionar_log(f"Erro ao selecionar diretório: {e}", logging.ERROR, "erro")
 
     def criar_painel_estatisticas(self, parent):
         """Cria o painel de estatísticas"""
@@ -536,34 +609,37 @@ class AutomacaoGUI:
 
     def adicionar_log(self, mensagem, level=logging.INFO, tag=None):
         """Adiciona mensagem ao log visual com cores"""
-        timestamp = datetime.now().strftime('%H:%M:%S')
+        try:
+            timestamp = datetime.now().strftime('%H:%M:%S')
 
-        # Determinar tag baseado no nível se não especificado
-        if tag is None:
-            if level >= logging.ERROR:
-                tag = "erro"
-            elif level >= logging.WARNING:
-                tag = "aviso"
-            elif "sucesso" in mensagem.lower() or "processad" in mensagem.lower():
-                tag = "sucesso"
-            else:
-                tag = "info"
+            # Determinar tag baseado no nível se não especificado
+            if tag is None:
+                if level >= logging.ERROR:
+                    tag = "erro"
+                elif level >= logging.WARNING:
+                    tag = "aviso"
+                elif "sucesso" in mensagem.lower() or "processad" in mensagem.lower():
+                    tag = "sucesso"
+                else:
+                    tag = "info"
 
-        # Prefixo visual
-        prefixos = {
-            "sucesso": "✅",
-            "erro": "❌",
-            "aviso": "⚠️",
-            "info": "ℹ️",
-            "processando": "⏳"
-        }
-        prefixo = prefixos.get(tag, "•")
+            # Prefixo visual
+            prefixos = {
+                "sucesso": "✅",
+                "erro": "❌",
+                "aviso": "⚠️",
+                "info": "ℹ️",
+                "processando": "⏳"
+            }
+            prefixo = prefixos.get(tag, "•")
 
-        # Inserir mensagem
-        self.log_text.insert("end", f"[{timestamp}] {prefixo} ", tag)
-        self.log_text.insert("end", f"{mensagem}\n", tag)
-        self.log_text.see("end")
-        self.window.update_idletasks()
+            # Inserir mensagem
+            self.log_text.insert("end", f"[{timestamp}] {prefixo} ", tag)
+            self.log_text.insert("end", f"{mensagem}\n", tag)
+            self.log_text.see("end")
+            self.window.update_idletasks()
+        except Exception:
+            pass
 
     def iniciar_automacao_thread(self):
         """Inicia a automação em uma thread separada"""
@@ -703,9 +779,10 @@ class AutomacaoGUI:
                         self.atualizar_estatisticas(sucesso=True)
                     else:
                         self.error_logger.error(f"{log_msg} - Erro no envio")
-                        self.adicionar_log(f"Processo interrompido na linha {index + 1}", logging.ERROR, "erro")
+                        self.adicionar_log(f"Erro na linha {index + 1}, fechando janelas e continuando...", logging.WARNING, "aviso")
                         self.atualizar_estatisticas(erro=True)
-                        break
+                        automacao.cleanup_windows()
+                        continue
 
                     time.sleep(2)
 
@@ -715,7 +792,8 @@ class AutomacaoGUI:
                     self.adicionar_log(erro_msg, logging.ERROR, "erro")
                     self.adicionar_log(f"Detalhes do erro: {traceback.format_exc()}", logging.ERROR, "erro")
                     self.atualizar_estatisticas(erro=True)
-                    break
+                    automacao.cleanup_windows()
+                    continue
 
             self.status_var.set("Processamento concluído")
             self.progress_bar.set(1.0)
@@ -725,6 +803,28 @@ class AutomacaoGUI:
                 f"Concluído! Sucesso: {self.stats['sucesso']} | Erros: {self.stats['erros']}",
                 logging.INFO, "sucesso"
             )
+
+            # Notificação Discord via webhook
+            try:
+                webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+                if webhook_url:
+                    competencia = self.competencia.get() or datetime.now().strftime("%m/%Y")
+                    diretorio_pdfs = self.diretorio_salvamento.get() or "Padrão do sistema"
+                    mensagem = (
+                        f"🗂️ **DomBot - Folha de Ponto**\n\n"
+                        f"📅 **Competência:** {competencia}\n"
+                        f"✅ **Sucesso:** {self.stats['sucesso']}\n"
+                        f"❌ **Erros:** {self.stats['erros']}\n"
+                        f"📂 **Diretório dos PDFs:** `{diretorio_pdfs}`\n\n"
+                        f"🏁 Emissão finalizada!\n\n"
+                        f"<@&1299044385899548752>"
+                    )
+                    requests.post(webhook_url, json={"content": mensagem}, timeout=10)
+                    self.adicionar_log("Notificação enviada ao Discord", logging.INFO, "sucesso")
+                else:
+                    self.adicionar_log("DISCORD_WEBHOOK_URL não configurado no .env", logging.WARNING, "aviso")
+            except Exception as e:
+                self.adicionar_log(f"Erro ao enviar notificação ao Discord: {str(e)}", logging.WARNING, "aviso")
 
         except Exception as e:
             erro_msg = f"Erro crítico: {str(e)}"
@@ -911,15 +1011,30 @@ class DominioAutomation:
 
             self.log(f"Diálogo detectado: '{found_title}' - {message[:100] if message else 'sem mensagem'}")
 
-            mensagens_continuar = [
+            message_lower = message.lower()
+
+            # Mensagens de aviso de gravação — fechar e continuar (janela de salvamento abre a seguir)
+            mensagens_continuar_salvamento = [
+                "erro na gravação do relatório",
+                "nome do caminho inválido",
+                "caracteres não permitidos"
+            ]
+            for msg in mensagens_continuar_salvamento:
+                if msg in message_lower:
+                    self.log(f"Aviso de gravação detectado (não crítico): {msg}")
+                    error_window.set_focus()
+                    send_keys('{ENTER}')
+                    time.sleep(0.5)
+                    return True
+
+            # Mensagens que indicam ausência de dados — aborta a linha atual
+            mensagens_abortar = [
                 "sem dados para emitir",
                 "nenhum registro encontrado",
                 "não há dados",
                 "registro não encontrado"
             ]
-
-            message_lower = message.lower()
-            for msg in mensagens_continuar:
+            for msg in mensagens_abortar:
                 if msg in message_lower:
                     self.log(f"Aviso não crítico: {msg}")
                     error_window.set_focus()
@@ -971,6 +1086,242 @@ class DominioAutomation:
         except Exception as e:
             self.log(f"Exceção ao verificar diálogos: {str(e)}")
             return True
+
+    def publicar_documento(self, row, main_window) -> bool:
+        """Publica o documento no Domínio antes de gerar o PDF"""
+        try:
+            if self.should_stop():
+                return False
+
+            self.log("Clicando no ícone de publicação")
+            main_window.set_focus()
+            time.sleep(0.3)
+
+            clicou = False
+            try:
+                button_publicacao = main_window.child_window(auto_id="1007", class_name="FNUDO3190")
+                if button_publicacao.exists():
+                    button_publicacao.click_input()
+                    clicou = True
+                    self.log("Botão de publicação clicado (auto_id=1007)")
+            except Exception as e:
+                self.log(f"Falha ao clicar via auto_id=1007: {str(e)}")
+
+            if not clicou:
+                try:
+                    botoes = main_window.children(class_name="FNUDO3190")
+                    self.log(f"Botões FNUDO3190 encontrados: {len(botoes)}")
+                    if len(botoes) > 1:
+                        botoes[1].click_input()
+                        clicou = True
+                        self.log("Botão de publicação clicado via fallback (índice 1)")
+                except Exception as e2:
+                    self.log(f"Fallback de publicação também falhou: {str(e2)}")
+
+            if not clicou:
+                self.log("Não foi possível clicar no botão de publicação")
+                return False
+
+            time.sleep(1)
+
+            if self.should_stop():
+                return False
+
+            if not self.wait_for_condition(
+                lambda: main_window.child_window(
+                    title="Publicação de Documentos",
+                    class_name="FNWNS3190"
+                ).exists(),
+                timeout=10,
+                poll_interval=0.2,
+                description="Aguardando janela Publicação de Documentos"
+            ):
+                self.log("Janela 'Publicação de Documentos' não encontrada")
+                return False
+
+            pub_doc_window = main_window.child_window(
+                title="Publicação de Documentos",
+                class_name="FNWNS3190"
+            )
+
+            self.log("Selecionando categoria: Pessoal/Folha de Ponto")
+            try:
+                combo_box = pub_doc_window.child_window(auto_id="1007", class_name="ComboBox")
+                combo_box.click_input()
+                time.sleep(0.5)
+                send_keys("Pessoal/Folha de Ponto{ENTER}")
+                time.sleep(0.5)
+            except Exception as e:
+                self.log(f"Erro ao selecionar categoria (tentando via TAB): {str(e)}")
+                send_keys("{TAB}")
+                time.sleep(0.3)
+                send_keys("Pessoal/Folha de Ponto{ENTER}")
+                time.sleep(0.5)
+
+            if self.should_stop():
+                return False
+
+            nome_pdf = sanitizar_nome_arquivo(str(row['nome pdf']))
+            self.log(f"Definindo nome da publicação: {nome_pdf}")
+            try:
+                edit_field = pub_doc_window.child_window(auto_id="1014", class_name="Edit")
+                edit_field.set_text(nome_pdf)
+            except Exception as e:
+                self.log(f"Erro ao preencher nome (tentando via teclado): {str(e)}")
+                send_keys("{TAB}{TAB}{HOME}+{END}" + nome_pdf)
+            time.sleep(0.3)
+
+            self.log("Clicando em Gravar")
+            try:
+                button_gravar = pub_doc_window.child_window(auto_id="1016", class_name="Button")
+                button_gravar.click_input()
+            except Exception as e:
+                self.log(f"Erro ao clicar em Gravar (tentando via ENTER): {str(e)}")
+                send_keys("{ENTER}")
+
+            if not self.wait_for_condition(
+                lambda: not pub_doc_window.exists() or not pub_doc_window.is_visible(),
+                timeout=10,
+                poll_interval=0.2,
+                description="Aguardando fechamento da Publicação de Documentos"
+            ):
+                self.log("Timeout aguardando fechamento da publicação")
+                return False
+
+            self.log("Documento publicado com sucesso")
+            return True
+
+        except Exception as e:
+            self.log(f"Erro na publicação do documento: {str(e)}")
+            return False
+
+    def gerar_pdf(self, row, main_window, diretorio: str = "") -> bool:
+        """Gera e salva o PDF do relatório via Ctrl+D em loop"""
+        try:
+            if self.should_stop():
+                return False
+
+            if not self.handle_error_dialogs():
+                self.cleanup_windows()
+                return False
+
+            self.log("Aguardando janela de salvamento (enviando Ctrl+D periodicamente)...")
+
+            timeout_total = 180
+            intervalo_ctrl_d = 5
+            inicio = time.time()
+            janela_encontrada = False
+
+            while time.time() - inicio < timeout_total:
+                if self.should_stop():
+                    return False
+
+                if self._any_error_dialog_visible():
+                    deve_continuar = self.handle_error_dialogs()
+                    if deve_continuar:
+                        self.log("Aviso tratado, continuando aguardo da janela de salvamento...")
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        self.log("Diálogo de erro detectado, abortando linha")
+                        self.cleanup_windows()
+                        return False
+
+                if self._window_exists("Salvar em PDF", "#32770"):
+                    janela_encontrada = True
+                    break
+
+                try:
+                    viewer = main_window.child_window(class_name="AfxMDIFrame140su")
+                    if not viewer.exists():
+                        viewer = main_window.child_window(class_name="FNWND3190", found_index=1)
+                    viewer.set_focus()
+                except Exception:
+                    main_window.set_focus()
+
+                send_keys('^d')
+                for _ in range(int(intervalo_ctrl_d / 0.25)):
+                    if self.should_stop():
+                        return False
+                    if self._any_error_dialog_visible():
+                        break
+                    if self._window_exists("Salvar em PDF", "#32770"):
+                        janela_encontrada = True
+                        break
+                    time.sleep(0.25)
+                if janela_encontrada:
+                    break
+
+            if not janela_encontrada:
+                self.log("Timeout aguardando janela de salvamento")
+                return False
+
+            if not self.handle_error_dialogs():
+                self.cleanup_windows()
+                return False
+
+            self.log("Configurando salvamento do PDF")
+            try:
+                save_window = main_window.child_window(
+                    title="Salvar em PDF",
+                    class_name="#32770"
+                )
+
+                if not save_window.exists():
+                    self.log("Janela de salvamento não encontrada")
+                    return False
+
+                if self.should_stop():
+                    return False
+                self.check_pause()
+
+                nome_pdf = sanitizar_nome_arquivo(str(row['nome pdf']))
+                if diretorio:
+                    caminho_pdf = os.path.join(diretorio, nome_pdf)
+                else:
+                    caminho_pdf = nome_pdf
+                self.log(f"Salvando em: {caminho_pdf}")
+                time.sleep(0.2)
+                name_field = save_window.child_window(auto_id="1148", class_name="Edit")
+                name_field.set_text(caminho_pdf)
+                time.sleep(0.3)
+
+                if self.should_stop():
+                    return False
+
+                self.log("Salvando PDF")
+                button_salvar = save_window.child_window(auto_id="1", class_name="Button")
+                button_salvar.click_input()
+
+                if not self.wait_for_condition(
+                    lambda: not save_window.exists() or not save_window.is_visible(),
+                    timeout=15,
+                    poll_interval=0.2,
+                    description="Aguardando salvamento do PDF"
+                ):
+                    self.log("Timeout aguardando salvamento do PDF")
+                    return False
+
+            except Exception as e:
+                self.log(f"Erro durante salvamento: {str(e)}")
+                return False
+
+            self.log("Fechando visualização do relatório")
+            send_keys('{ESC}')
+
+            if not self.wait_for_condition(
+                lambda: self._window_exists("Gerenciador de Relatórios", "FNWND3190"),
+                timeout=5,
+                poll_interval=0.15,
+                description="Aguardando retorno ao Gerenciador"
+            ):
+                time.sleep(0.3)
+
+            return True
+
+        except Exception as e:
+            self.log(f"Erro na geração do PDF: {str(e)}")
+            return False
 
     def cleanup_windows(self):
         """Limpa e fecha janelas abertas"""
@@ -1274,270 +1625,35 @@ class DominioAutomation:
                 if not self.smart_sleep(8):
                     return False
 
-                # Verificar se apareceu erro durante a execução do relatório
+                # Verificar se apareceu erro durante/após a execução do relatório
+                if self._any_error_dialog_visible():
+                    if not self.handle_error_dialogs():
+                        self.cleanup_windows()
+                        return False
+
+                # Verificar novamente após tratar diálogos (ex: "sem dados para emitir" pode aparecer com delay)
                 if self._any_error_dialog_visible():
                     if not self.handle_error_dialogs():
                         self.cleanup_windows()
                         return False
 
                 # === PUBLICAÇÃO DO DOCUMENTO ===
-                # Aguardar carregamento completo dos botões antes de clicar
-                # Os botões do visualizador levam alguns segundos para estabilizar
                 self.log("Aguardando carregamento dos botões do visualizador...")
                 if not self.smart_sleep(5):
                     return False
 
-                max_tentativas_pub = 5
-                pub_ok = False
-
-                for tentativa_pub in range(max_tentativas_pub):
-                    self.log(f"Clicando no ícone de publicação (tentativa {tentativa_pub + 1})")
-                    main_window.set_focus()
-                    try:
-                        # Buscar o botão de publicação (auto_id="1006", FNUDO3190)
-                        # na barra lateral esquerda do visualizador
-                        botoes = main_window.descendants(class_name="FNUDO3190")
-                        button_publicacao = None
-                        for btn in botoes:
-                            try:
-                                elem_info = btn.element_info
-                                if elem_info.automation_id != "1006":
-                                    continue
-                                rect = btn.rectangle()
-                                largura = rect.right - rect.left
-                                altura = rect.bottom - rect.top
-                                # Botão da barra lateral: fica na esquerda (x < 100) e tamanho ~65x40
-                                if rect.left < 100 and 30 <= largura <= 80 and 20 <= altura <= 60:
-                                    button_publicacao = btn
-                                    self.log(f"Botão publicação encontrado: ({rect.left},{rect.top})-({rect.right},{rect.bottom})")
-                                    break
-                            except Exception:
-                                continue
-
-                        if not button_publicacao:
-                            # Fallback: pegar qualquer 1006/FNUDO3190
-                            for btn in botoes:
-                                try:
-                                    if btn.element_info.automation_id == "1006":
-                                        button_publicacao = btn
-                                        self.log("Usando fallback: primeiro botão 1006 encontrado")
-                                        break
-                                except Exception:
-                                    continue
-
-                        if button_publicacao:
-                            button_publicacao.click_input()
-                        else:
-                            self.log("Nenhum botão com auto_id=1006/FNUDO3190 encontrado")
-                            if not self.smart_sleep(2):
-                                return False
-                            continue
-                    except Exception as e:
-                        self.log(f"Erro ao localizar botão de publicação: {e}")
-                        if not self.smart_sleep(2):
-                            return False
-                        continue
-                    if not self.smart_sleep(2):
-                        return False
-
-                    # Verificar se abriu "Portal do Cliente" em vez de "Publicação de Documentos"
-                    portal_aberto = False
-                    try:
-                        portal_window = main_window.child_window(
-                            title="Portal do Cliente",
-                            class_name="Chrome_RenderWidgetHostHWND"
-                        )
-                        if portal_window.exists() and portal_window.is_visible():
-                            portal_aberto = True
-                            self.log("Janela 'Portal do Cliente' aberta por engano - fechando")
-                            # Fechar o portal
-                            send_keys('{ESC}')
-                            if not self.smart_sleep(1):
-                                return False
-                            send_keys('^w')
-                            if not self.smart_sleep(1):
-                                return False
-                            # Enviar ESC adicional para garantir fechamento
-                            send_keys('{ESC}')
-                            if not self.smart_sleep(1):
-                                return False
-                    except Exception:
-                        pass
-
-                    if portal_aberto:
-                        # Esperar mais tempo para os botões estabilizarem antes da próxima tentativa
-                        self.log("Aguardando estabilização dos botões...")
-                        if not self.smart_sleep(3):
-                            return False
-                        continue
-
-                    # Verificar se a janela de publicação abriu corretamente
-                    if self.wait_for_condition(
-                        lambda: main_window.child_window(
-                            title="Publicação de Documentos",
-                            class_name="FNWNS3190"
-                        ).exists(),
-                        timeout=5,
-                        poll_interval=0.2,
-                        description="Aguardando janela Publicação de Documentos"
-                    ):
-                        pub_ok = True
-                        break
-                    else:
-                        self.log("Janela de publicação não apareceu, tentando novamente...")
-                        send_keys('{ESC}')
-                        if not self.smart_sleep(2):
-                            return False
-
-                if not pub_ok:
-                    self.log("Não foi possível abrir a janela de Publicação de Documentos após várias tentativas")
-                    return False
-
-                try:
-                    pub_doc_window = main_window.child_window(
-                        title="Publicação de Documentos",
-                        class_name="FNWNS3190"
-                    )
-
-                    self.log("Janela de publicação localizada")
-
-                    # Selecionar categoria no ComboBox
-                    self.log("Selecionando categoria: Pessoal/Folha de Ponto")
-                    combo_box = pub_doc_window.child_window(auto_id="1007", class_name="ComboBox")
-                    combo_box.click_input()
-                    time.sleep(0.5)
-                    send_keys("Pessoal/Folha de Ponto{ENTER}")
-                    time.sleep(0.5)
-
-                    if self.should_stop():
-                        return False
-
-                    # Definir nome do documento
-                    nome_pdf = sanitizar_nome_arquivo(str(row['nome pdf']))
-                    self.log(f"Definindo nome do PDF: {nome_pdf}")
-                    edit_field = pub_doc_window.child_window(auto_id="1014", class_name="Edit")
-                    edit_field.set_text(nome_pdf)
-                    time.sleep(0.3)
-
-                    # Clicar em Gravar
-                    self.log("Clicando em gravar")
-                    button_gravar = pub_doc_window.child_window(auto_id="1016", class_name="Button")
-                    button_gravar.click_input()
-
-                    # Aguardar fechamento da janela de publicação
-                    if not self.wait_for_condition(
-                        lambda: not pub_doc_window.exists() or not pub_doc_window.is_visible(),
-                        timeout=10,
-                        poll_interval=0.2,
-                        description="Aguardando fechamento da Publicação de Documentos"
-                    ):
-                        self.log("Timeout aguardando fechamento da publicação")
-                        return False
-
-                    self.log("Documento publicado com sucesso")
-
-                    # === GERAÇÃO DO PDF ===
-                    # Verificar e tratar janela de erro
+                # Verificar erros que possam ter aparecido durante o carregamento
+                if self._any_error_dialog_visible():
                     if not self.handle_error_dialogs():
                         self.cleanup_windows()
                         return False
 
-                    # Aguardar processamento da publicação
-                    if not self.smart_sleep(3):
-                        return False
+                # Publicar documento
+                if not self.publicar_documento(row, main_window):
+                    self.log("Erro na publicação do documento, continuando para gerar PDF")
 
-                    self.log("Gerando PDF (Ctrl+D)")
-                    main_window.set_focus()
-                    send_keys('^d')
-
-                    # Esperar janela "Salvar em PDF" ou diálogo de erro
-                    if not self.wait_for_condition(
-                        lambda: self._window_exists("Salvar em PDF", "#32770") or self._any_error_dialog_visible(),
-                        timeout=10,
-                        poll_interval=0.15,
-                        description="Aguardando janela Salvar em PDF"
-                    ):
-                        self.log("Timeout aguardando janela de salvamento PDF")
-                        return False
-
-                    # Se apareceu diálogo de erro, apenas fechar e continuar
-                    # (o Domínio pode mostrar erro de gravação mas a janela Salvar em PDF aparece depois)
-                    if self._any_error_dialog_visible():
-                        self.log("Diálogo de erro detectado após gerar PDF, fechando e continuando...")
-                        try:
-                            error_win = main_window.child_window(title="Erro", class_name="#32770")
-                            if error_win.exists() and error_win.is_visible():
-                                ok_btn = error_win.child_window(title="OK", class_name="Button")
-                                if ok_btn.exists():
-                                    ok_btn.click_input()
-                                    time.sleep(0.5)
-                                    self.log("Botão OK clicado no diálogo de erro")
-                        except Exception as e:
-                            self.log(f"Erro ao fechar diálogo: {e}")
-                            send_keys('{ENTER}')
-                            time.sleep(0.5)
-
-                        # Aguardar a janela "Salvar em PDF" aparecer após fechar o erro
-                        if not self.wait_for_condition(
-                            lambda: self._window_exists("Salvar em PDF", "#32770"),
-                            timeout=10,
-                            poll_interval=0.15,
-                            description="Aguardando janela Salvar em PDF após fechar erro"
-                        ):
-                            self.log("Janela Salvar em PDF não apareceu após fechar erro")
-                            self.cleanup_windows()
-                            return False
-
-                    # Localizar janela de salvamento
-                    self.log("Configurando salvamento do PDF")
-                    try:
-                        save_window = main_window.child_window(
-                            title="Salvar em PDF",
-                            class_name="#32770"
-                        )
-
-                        if not save_window.exists():
-                            self.log("Janela de salvamento não encontrada")
-                            return False
-
-                        if self.should_stop():
-                            return False
-                        self.check_pause()
-
-                        time.sleep(0.5)
-                        name_field = save_window.child_window(auto_id="1148", class_name="Edit")
-                        name_field.set_text(nome_pdf)
-                        time.sleep(0.3)
-
-                        if self.should_stop():
-                            return False
-
-                        self.log("Salvando PDF")
-                        button_salvar = save_window.child_window(auto_id="1", class_name="Button")
-                        button_salvar.click_input()
-
-                        # Esperar janela de salvamento fechar
-                        if not self.wait_for_condition(
-                            lambda: not save_window.exists() or not save_window.is_visible(),
-                            timeout=15,
-                            poll_interval=0.2,
-                            description="Aguardando salvamento do PDF"
-                        ):
-                            self.log("Timeout aguardando salvamento do PDF")
-                            return False
-
-                    except Exception as e:
-                        self.log(f"Erro durante salvamento: {str(e)}")
-                        return False
-
-                    # Fechar visualização do relatório
-                    self.log("Fechando janelas")
-                    send_keys('{ESC}')
-                    if not self.smart_sleep(1):
-                        return False
-
-                except Exception as e:
-                    self.log(f"Erro na publicação: {str(e)}")
+                # Gerar PDF
+                if not self.gerar_pdf(row, main_window, self.gui.diretorio_salvamento.get()):
                     return False
 
                 # Limpeza final - fechar janelas restantes
